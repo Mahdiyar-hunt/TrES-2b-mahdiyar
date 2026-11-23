@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# tres2b - quick poc runner for cors / idor / race / jwt
-# written for authorized bounty work. no warranty.
+# tres2b — poc runner for cors / idor / race / jwt
+# authorized bounty work only. no warranty, no mercy.
 #
 # usage:
-#   ./tres2b.py                      # interactive
-#   ./tres2b.py --cors https://x/y   # cli
+#   ./tres2b.py                              # interactive
+#   ./tres2b.py --cors https://x/y           # cli
+#   ./tres2b.py --cors a b --verify --yes    # batch
 #
-# notes to self:
-#  - python 3.11+ needed for asyncio.Barrier
-#  - don't crank --race-count above ~30 without a proxy, you'll get 429'd
-#  - ssl verify is off by default, turn it on with --verify if you care
+# env:
+#   TRES2B_TOKEN   fallback for --token-a / race token (keeps it out of ps)
+#
+# notes:
+#   - py3.11+ for asyncio.Barrier. on older, race falls back to gather+stagger
+#   - default ssl verify is ON now. flip with --insecure if you really must
+#   - keep --race-count sane (~10-30). no backoff, you'll eat 429s
 # -----------------------------------------------------------------------------
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import base64
 import json
+import os
 import random
 import sys
 from datetime import datetime, timezone
+from functools import partial
+from typing import Any, Awaitable, Callable, Iterable
 
 try:
     import aiohttp
@@ -31,7 +40,6 @@ try:
     from colorama import Fore, Style, init as _cinit
     _cinit(autoreset=True)
 except ImportError:
-    # minimal shim, we don't need much
     class _F:
         RED = GREEN = YELLOW = CYAN = MAGENTA = BLUE = RESET = ""
     class _S:
@@ -39,7 +47,7 @@ except ImportError:
     Fore, Style = _F, _S
 
 
-# --- misc helpers -----------------------------------------------------------
+# --- plumbing ---------------------------------------------------------------
 
 _UA_POOL = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -58,15 +66,15 @@ _TAG_COLOR = {
 }
 
 
-def say(tag, msg):
+def say(tag: str, msg: str) -> None:
     print(f"{_TAG_COLOR.get(tag, '')}[{tag}]{Style.RESET_ALL} {msg}")
 
 
-def ua():
+def ua() -> str:
     return random.choice(_UA_POOL)
 
 
-def prompt(label, default=""):
+def prompt(label: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
     try:
         v = input(f"{Fore.CYAN}?{Style.RESET_ALL} {label}{suffix}: ").strip()
@@ -76,182 +84,300 @@ def prompt(label, default=""):
     return v or default
 
 
-def _b64pad(s):
+def _b64pad(s: str) -> str:
     return s + "=" * (-len(s) % 4)
 
 
-# --- findings ---------------------------------------------------------------
+def _jwt_parts(tok: str) -> tuple[dict, dict] | None:
+    bits = tok.split(".")
+    if len(bits) != 3:
+        return None
+    try:
+        hdr = json.loads(base64.urlsafe_b64decode(_b64pad(bits[0])))
+        pay = json.loads(base64.urlsafe_b64decode(_b64pad(bits[1])))
+    except Exception:
+        return None
+    return hdr, pay
 
-def finding(kind, sev, **kw):
+
+def finding(kind: str, sev: str, **kw: Any) -> dict:
     d = {"type": kind, "severity": sev}
     d.update(kw)
     return d
 
 
-# --- tests ------------------------------------------------------------------
+# --- cors -------------------------------------------------------------------
 
-async def test_cors(session, url, origin="https://evil.example"):
+# null + evil + subdomain-shaped origin covers the usual bypasses
+_CORS_PROBES = (
+    "https://evil.example",
+    "null",
+    "https://evil.example.com",
+)
+
+
+async def test_cors(session: aiohttp.ClientSession, url: str) -> list[dict]:
     say("INFO", f"cors {url}")
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    for origin in _CORS_PROBES:
+        try:
+            async with session.get(
+                url,
+                headers={"Origin": origin, "User-Agent": ua()},
+                allow_redirects=False,
+            ) as r:
+                acao = (r.headers.get("Access-Control-Allow-Origin") or "").strip()
+                acac = (r.headers.get("Access-Control-Allow-Credentials") or "").lower()
+                vary = (r.headers.get("Vary") or "").lower()
+        except Exception as e:
+            say("DBG", f"cors fail {origin} {url}: {e!r}")
+            continue
+
+        key = f"{acao}|{acac}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # real magic: reflected origin + creds. wildcard+creds is a browser myth,
+        # so we only flag *reflected* origin with creds, and reflected origin alone.
+        if acao == origin and acac == "true":
+            out.append(finding(
+                "CORS_REFLECT_CREDS", "HIGH", url=url,
+                detail=f"Origin={origin} ACAO={acao} ACAC={acac}",
+            ))
+        elif acao == origin:
+            out.append(finding(
+                "CORS_REFLECT", "MEDIUM", url=url,
+                detail=f"Origin={origin} ACAO={acao}",
+            ))
+        elif acao == "null" and origin == "null":
+            out.append(finding(
+                "CORS_NULL_ORIGIN", "HIGH", url=url,
+                detail="ACAO=null (sandbox iframe / file:// vector)",
+            ))
+
+        # caching bug: reflected origin without Vary: Origin
+        if acao == origin and origin not in ("null",) and "origin" not in vary:
+            out.append(finding(
+                "CORS_NO_VARY", "LOW", url=url,
+                detail="reflected origin but no Vary: Origin",
+            ))
+
+    return out
+
+
+# --- idor -------------------------------------------------------------------
+
+async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
+                 hdr: dict, body: Any = None) -> tuple[int, str] | None:
     try:
-        async with session.get(
-            url, headers={"Origin": origin, "User-Agent": ua()},
-            ssl=session._ssl_ctx is not False,
-        ) as r:
-            acao = r.headers.get("Access-Control-Allow-Origin", "")
-            acac = r.headers.get("Access-Control-Allow-Credentials", "").lower()
+        async with session.request(method, url, headers=hdr, json=body,
+                                   allow_redirects=False) as r:
+            return r.status, await r.text()
     except Exception as e:
-        say("DBG", f"cors fail {url}: {e!r}")
+        say("DBG", f"{method} {url} fail: {e!r}")
         return None
 
-    # reflected origin + creds = the money shot
-    if acao == origin and acac == "true":
-        return finding("CORS_REFLECT_CREDS", "HIGH", url=url,
-                       detail=f"ACAO={acao} ACAC={acac}")
-    if acao == "*" and acac == "true":
-        return finding("CORS_WILDCARD_CREDS", "HIGH", url=url,
-                       detail="ACAO=* ACAC=true")
-    if acao == origin:
-        return finding("CORS_REFLECT", "MEDIUM", url=url,
-                       detail=f"ACAO={acao}")
-    return None
 
-
-async def test_idor(session, endpoint, token_a, resource_b):
+async def test_idor(session: aiohttp.ClientSession, endpoint: str,
+                    token_a: str, token_b: str, resource_b: str) -> list[dict]:
     if "{id}" not in endpoint:
         say("WARN", "idor endpoint needs {id} placeholder, skipping")
-        return None
+        return []
+
     url = endpoint.replace("{id}", str(resource_b))
+    hdr_a = {"Authorization": f"Bearer {token_a}", "User-Agent": ua()}
+    hdr_b = {"Authorization": f"Bearer {token_b}", "User-Agent": ua()}
+
     say("INFO", f"idor {url}")
-    hdr = {"Authorization": f"Bearer {token_a}", "User-Agent": ua()}
-    try:
-        async with session.get(url, headers=hdr,
-                               ssl=session._ssl_ctx is not False) as r:
-            body = await r.text()
-    except Exception as e:
-        say("DBG", f"idor fail {url}: {e!r}")
-        return None
+    out: list[dict] = []
 
-    # 200 + non-trivial body from *another* account's id is the signal.
-    # small bodies are usually error pages that return 200, so ignore them.
-    if r.status == 200 and len(body) > 50:
-        return finding("IDOR", "CRITICAL", url=url,
-                       detail=f"200, {len(body)}b from acct-B id")
-    return None
+    # baseline: B reading its own resource. if this 404s, the id is bogus.
+    base = await _fetch(session, "GET", url, hdr_b)
+    if base is None:
+        return []
+    if base[0] not in (200, 201):
+        say("DBG", f"idor baseline {base[0]}, id likely invalid")
+        return []
+
+    # A reading B's resource = the actual signal
+    got = await _fetch(session, "GET", url, hdr_a)
+    if got is None:
+        return []
+    status, body = got
+
+    # require 200 AND body that looks like B's payload, not a generic error page
+    same_shape = len(body) > 50 and body.strip() and body != base[1][:len(body)]
+    if status == 200 and same_shape:
+        out.append(finding(
+            "IDOR_READ", "CRITICAL", url=url, method="GET",
+            detail=f"A got 200 ({len(body)}b) on B's resource",
+            sample=body[:160],
+        ))
+
+    # write-side: try PUT/PATCH/DELETE with a harmless marker
+    for method in ("PUT", "PATCH"):
+        w = await _fetch(session, method, url, hdr_a, {"idor": "marker"})
+        if w and w[0] in (200, 204):
+            out.append(finding(
+                "IDOR_WRITE", "CRITICAL", url=url, method=method,
+                detail=f"A {method} on B's resource -> {w[0]}",
+            ))
+            break
+
+    return out
 
 
-async def _race_worker(session, url, method, body, hdr, barrier, i, verify):
-    await barrier.wait()
+# --- race -------------------------------------------------------------------
+
+async def _race_worker(session, url, method, body, hdr, barrier, i):
+    if barrier is not None:
+        try:
+            await asyncio.wait_for(barrier.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            return i, -1, "barrier timeout"
     try:
         async with session.request(method, url, json=body, headers=hdr,
-                                   ssl=verify) as r:
-            txt = await r.text()
-            return i, r.status, txt
+                                   allow_redirects=False) as r:
+            return i, r.status, await r.text()
     except Exception as e:
         return i, -1, repr(e)
 
 
-async def test_race(session, url, method, body, token, count, verify):
+async def test_race(session: aiohttp.ClientSession, url: str, method: str,
+                    body: Any, token: str, count: int) -> list[dict]:
     if count < 2:
         say("WARN", "race needs count>=2")
-        return None
+        return []
+
     say("INFO", f"race {url} x{count}")
-    hdr = {"Authorization": f"Bearer {token}",
-           "User-Agent": ua(),
+    hdr = {"Authorization": f"Bearer {token}", "User-Agent": ua(),
            "Content-Type": "application/json"}
-    barrier = asyncio.Barrier(count)
+
+    barrier = asyncio.Barrier(count) if hasattr(asyncio, "Barrier") else None
+    if barrier is None:
+        say("DBG", "no asyncio.Barrier, staggering instead")
+
     results = await asyncio.gather(*(
-        _race_worker(session, url, method, body, hdr, barrier, i, verify)
+        _race_worker(session, url, method, body, hdr, barrier, i)
         for i in range(count)
     ))
-    ok = [(i, s, t) for i, s, t in results if s in (200, 201, 202)]
-    say("DBG", f"race {len(ok)}/{count} ok")
-    if len(ok) > 1:
-        return finding(
-            "RACE", "CRITICAL", url=url,
-            detail=f"{len(ok)}/{count} succeeded (expected <=1)",
+
+    ok = [(i, s, t) for i, s, t in results if s in (200, 201, 202, 204)]
+    say("DBG", f"race {len(ok)}/{count} accepted")
+
+    # without a state oracle, "many 2xx" is not a vuln. we still surface it,
+    # but flagged as INFO unless statuses *differ* between winners.
+    if len(ok) <= 1:
+        return []
+
+    statuses = {s for _, s, _ in ok}
+    bodies = {t for _, _, t in ok}
+
+    if len(statuses) > 1 or len(bodies) > 1:
+        return [finding(
+            "RACE_INCONSISTENT", "HIGH", url=url, method=method,
+            detail=f"{len(ok)}/{count} accepted with inconsistent responses",
             sample=[{"i": i, "status": s, "body": t[:120]} for i, s, t in ok[:3]],
-        )
-    return None
+        )]
+
+    return [finding(
+        "RACE_MULTI_ACCEPT", "INFO", url=url, method=method,
+        detail=(f"{len(ok)}/{count} accepted identically — confirm state "
+                f"impact manually (idempotent endpoint?)"),
+    )]
 
 
-def analyze_jwt(tok):
+# --- jwt --------------------------------------------------------------------
+
+def analyze_jwt(tok: str) -> list[dict]:
     say("INFO", "jwt analyzing")
-    parts = tok.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        hdr = json.loads(base64.urlsafe_b64decode(_b64pad(parts[0])))
-        payload = json.loads(base64.urlsafe_b64decode(_b64pad(parts[1])))
-    except Exception as e:
-        say("DBG", f"jwt decode fail: {e!r}")
-        return None
+    parsed = _jwt_parts(tok)
+    if parsed is None:
+        return []
+    hdr, pay = parsed
 
-    out = []
+    out: list[dict] = []
     alg = (hdr.get("alg") or "").lower()
+
     if alg == "none":
         out.append(finding("JWT_ALG_NONE", "CRITICAL",
-                           detail="alg=none; server may accept unsigned tokens"))
-    if alg.startswith("hs"):
+                           detail="alg=none; verify server actually accepts unsigned"))
+    elif alg.startswith("hs"):
         out.append(finding("JWT_HMAC", "INFO",
-                           detail=f"alg={alg}; try weak-key or kid-injection"))
-    if alg.startswith("rs") or alg.startswith("es"):
+                           detail=f"alg={alg}; test weak key / kid injection"))
+    elif alg.startswith(("rs", "es", "ps")):
         out.append(finding("JWT_ASYM", "INFO",
-                           detail=f"alg={alg}; try alg-confusion (rs->hs)"))
-    if "exp" not in payload:
-        out.append(finding("JWT_NO_EXP", "MEDIUM",
-                           detail="no exp claim"))
-    else:
-        exp = payload.get("exp")
-        if isinstance(exp, (int, float)) and exp < datetime.now(timezone.utc).timestamp():
-            out.append(finding("JWT_EXPIRED", "INFO",
-                               detail="token already expired"))
-    return out or None
+                           detail=f"alg={alg}; test alg-confusion (rs->hs)"))
+
+    now = datetime.now(timezone.utc).timestamp()
+    if "exp" not in pay:
+        out.append(finding("JWT_NO_EXP", "MEDIUM", detail="no exp claim"))
+    elif isinstance(pay["exp"], (int, float)) and pay["exp"] < now:
+        out.append(finding("JWT_EXPIRED", "INFO", detail="token already expired"))
+
+    if "nbf" in pay and isinstance(pay["nbf"], (int, float)) and pay["nbf"] > now:
+        out.append(finding("JWT_NBF_FUTURE", "LOW", detail="nbf in future"))
+    if not pay.get("aud"):
+        out.append(finding("JWT_NO_AUD", "LOW", detail="no aud claim"))
+    if not pay.get("iss"):
+        out.append(finding("JWT_NO_ISS", "LOW", detail="no iss claim"))
+
+    return out
 
 
-# --- orchestration ----------------------------------------------------------
+# --- runner -----------------------------------------------------------------
+
+Job = Callable[[aiohttp.ClientSession], Awaitable[list[dict] | dict | None]]
+
 
 class Runner:
-    """Owns one aiohttp session for the whole run. Avoids the session-holder
-    hack that plagued the earlier draft."""
-
-    def __init__(self, verify=True, concurrency=30, timeout=25):
+    def __init__(self, verify: bool = True, concurrency: int = 30,
+                 timeout: int = 25):
         self.verify = verify
         self._limit = concurrency
         self._timeout = timeout
-        self._session = None
+        self._session: aiohttp.ClientSession | None = None
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "Runner":
         conn = aiohttp.TCPConnector(ssl=self.verify, limit=self._limit)
         tmo = aiohttp.ClientTimeout(total=self._timeout)
         self._session = aiohttp.ClientSession(connector=conn, timeout=tmo)
         return self
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, *exc: Any) -> None:
         if self._session:
             await self._session.close()
 
-    async def cors(self, url):
-        return await test_cors(self._session, url)
+    def cors(self, url: str) -> Job:
+        return partial(test_cors, self._session, url)
 
-    async def idor(self, endpoint, token_a, resource_b):
-        return await test_idor(self._session, endpoint, token_a, resource_b)
+    def idor(self, ep: str, ta: str, tb: str, rb: str) -> Job:
+        return partial(test_idor, self._session, ep, ta, tb, rb)
 
-    async def race(self, url, method, body, token, count):
-        return await test_race(self._session, url, method, body, token,
-                               count, self.verify)
+    def race(self, url: str, method: str, body: Any, token: str,
+             count: int) -> Job:
+        return partial(test_race, self._session, url, method, body, token, count)
 
 
-async def run_jobs(runner, jobs):
-    raw = await asyncio.gather(*(j(runner) for j in jobs))
-    flat = []
+async def run_jobs(runner: Runner, jobs: Iterable[Job]) -> list[dict]:
+    if not jobs:
+        return []
+    raw = await asyncio.gather(*(j(runner._session) for j in jobs))
+    flat: list[dict] = []
     for r in raw:
         if not r:
             continue
-        flat.extend(r) if isinstance(r, list) else flat.append(r)
+        if isinstance(r, list):
+            flat.extend(r)
+        else:
+            flat.append(r)
     return flat
 
 
-def write_report(vulns, path):
+def write_report(vulns: list[dict], path: str) -> None:
     payload = {
         "tool": "tres2b",
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -263,23 +389,24 @@ def write_report(vulns, path):
     say("INFO", f"report written -> {path}")
 
 
-def show(vulns):
+def show(vulns: list[dict]) -> None:
     print()
     if not vulns:
         say("OK", "clean. try harder next time.")
         return
     say("VULN", f"{len(vulns)} finding(s):")
     for v in vulns:
-        c = Fore.RED if v.get("severity") == "CRITICAL" else Fore.YELLOW
-        print(f"  {c}[{v['severity']}]{Style.RESET_ALL} "
-              f"{v['type']} -> {v.get('url', 'token')}")
+        sev = v.get("severity", "INFO")
+        c = Fore.RED if sev in ("CRITICAL", "HIGH") else Fore.YELLOW
+        print(f"  {c}[{sev}]{Style.RESET_ALL} {v['type']} -> "
+              f"{v.get('url', v.get('method', 'token'))}")
 
 
-def confirm_scope(skip):
+def confirm_scope(skip: bool) -> None:
     if skip:
         return
     print(f"{Fore.YELLOW}{'=' * 64}")
-    print(" authorized use only. you must have written permission.")
+    print(" authorized use only. written permission required.")
     print(" unauthorized testing is illegal. you own the consequences.")
     print(f"{'=' * 64}{Style.RESET_ALL}")
     if prompt("continue? (yes/no)", "no").lower() != "yes":
@@ -289,7 +416,7 @@ def confirm_scope(skip):
 
 # --- interactive ------------------------------------------------------------
 
-def interactive():
+def interactive() -> None:
     confirm_scope(False)
     print()
     print(f"{Fore.CYAN}tests:{Style.RESET_ALL}")
@@ -300,7 +427,10 @@ def interactive():
     print("  5) all")
     choice = prompt("pick", "1")
 
-    cors_urls, idor_args, race_args, jwt_tok = [], None, None, None
+    cors_urls: list[str] = []
+    idor_args: tuple | None = None
+    race_args: tuple | None = None
+    jwt_tok = ""
 
     if choice in ("1", "5"):
         raw = prompt("cors urls (comma-separated)", "")
@@ -309,19 +439,21 @@ def interactive():
     if choice in ("2", "5"):
         ep = prompt("idor endpoint ({id} placeholder)", "")
         ta = prompt("token A", "")
+        tb = prompt("token B", "")
         rb = prompt("account B resource id", "")
-        if ep and ta and rb:
-            idor_args = (ep, ta, rb)
+        if ep and ta and tb and rb:
+            idor_args = (ep, ta, tb, rb)
 
     if choice in ("3", "5"):
         ru = prompt("race url", "")
         rm = prompt("method", "POST").upper()
-        rbody = prompt("json body", "{}")
-        rt = prompt("token", "")
-        rc = prompt("count", "10")
+        rbody_raw = prompt("json body", "{}")
+        rt = prompt("token (blank = $TRES2B_TOKEN)",
+                    os.environ.get("TRES2B_TOKEN", ""))
+        rc_raw = prompt("count", "10")
         try:
-            rc = int(rc)
-            rbody = json.loads(rbody) if rbody else {}
+            rc = int(rc_raw)
+            rbody = json.loads(rbody_raw) if rbody_raw else {}
         except ValueError:
             say("WARN", "bad count or body, skipping race")
         else:
@@ -331,24 +463,19 @@ def interactive():
     if choice in ("4", "5"):
         jwt_tok = prompt("jwt token", "")
 
-    verify = prompt("verify tls? (y/n)", "n").lower() == "y"
+    verify = prompt("verify tls? (y/n)", "y").lower() != "n"
 
-    async def _go():
-        vulns = []
+    async def _go() -> list[dict]:
+        vulns: list[dict] = []
         async with Runner(verify=verify) as r:
-            jobs = []
-            for u in cors_urls:
-                jobs.append(lambda r=r, u=u: r.cors(u))
+            jobs: list[Job] = [r.cors(u) for u in cors_urls]
             if idor_args:
-                jobs.append(lambda r=r, a=idor_args: r.idor(*a))
+                jobs.append(r.idor(*idor_args))
             if race_args:
-                jobs.append(lambda r=r, a=race_args: r.race(*a))
-            if jobs:
-                vulns.extend(await run_jobs(r, jobs))
+                jobs.append(r.race(*race_args))
+            vulns.extend(await run_jobs(r, jobs))
         if jwt_tok:
-            found = analyze_jwt(jwt_tok)
-            if found:
-                vulns.extend(found)
+            vulns.extend(analyze_jwt(jwt_tok))
         return vulns
 
     vulns = asyncio.run(_go())
@@ -358,11 +485,12 @@ def interactive():
 
 # --- cli --------------------------------------------------------------------
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="tres2b poc runner")
     p.add_argument("--cors", nargs="*", metavar="URL")
     p.add_argument("--idor-endpoint")
     p.add_argument("--token-a")
+    p.add_argument("--token-b")
     p.add_argument("--resource-b")
     p.add_argument("--race-url")
     p.add_argument("--race-method", default="POST")
@@ -370,37 +498,35 @@ def build_parser():
     p.add_argument("--race-count", type=int, default=10)
     p.add_argument("--jwt")
     p.add_argument("--output", default="report.json")
-    p.add_argument("--verify", action="store_true",
-                   help="verify TLS (default: off)")
+    p.add_argument("--insecure", action="store_true",
+                   help="disable TLS verification (default: verify)")
     p.add_argument("--yes", action="store_true", help="skip scope warning")
     return p
 
 
-def cli(argv):
+def cli(argv: list[str]) -> None:
     args = build_parser().parse_args(argv)
     confirm_scope(args.yes)
 
-    async def _go():
-        vulns = []
-        async with Runner(verify=args.verify) as r:
-            jobs = [lambda r=r, u=u: r.cors(u) for u in (args.cors or [])]
-            if args.idor_endpoint and args.token_a and args.resource_b:
-                jobs.append(lambda r=r: r.idor(
-                    args.idor_endpoint, args.token_a, args.resource_b))
-            if args.race_url and args.token_a:
+    token_a = args.token_a or os.environ.get("TRES2B_TOKEN", "")
+
+    async def _go() -> list[dict]:
+        vulns: list[dict] = []
+        async with Runner(verify=not args.insecure) as r:
+            jobs: list[Job] = [r.cors(u) for u in (args.cors or [])]
+            if args.idor_endpoint and token_a and args.token_b and args.resource_b:
+                jobs.append(r.idor(args.idor_endpoint, token_a,
+                                   args.token_b, args.resource_b))
+            if args.race_url and token_a:
                 try:
                     body = json.loads(args.race_body) if args.race_body else {}
                 except json.JSONDecodeError as e:
                     sys.exit(f"bad --race-body json: {e}")
-                jobs.append(lambda r=r: r.race(
-                    args.race_url, args.race_method, body,
-                    args.token_a, args.race_count))
-            if jobs:
-                vulns.extend(await run_jobs(r, jobs))
+                jobs.append(r.race(args.race_url, args.race_method, body,
+                                   token_a, args.race_count))
+            vulns.extend(await run_jobs(r, jobs))
         if args.jwt:
-            found = analyze_jwt(args.jwt)
-            if found:
-                vulns.extend(found)
+            vulns.extend(analyze_jwt(args.jwt))
         return vulns
 
     vulns = asyncio.run(_go())
@@ -408,12 +534,9 @@ def cli(argv):
     write_report(vulns, args.output)
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
-        interactive()
-    else:
-        cli(argv)
+    (interactive if not argv else cli)(argv) if argv else interactive()
 
 
 if __name__ == "__main__":
